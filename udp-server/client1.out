@@ -1,0 +1,31 @@
+Got 1.2.3.4 on port 1234 with n=25 timeout=10
+1: Dropped
+2: Dropped
+3: Dropped
+4: Dropped
+5: -0.0013 0.0606
+6: Dropped
+7: Dropped
+8: 0.0001 0.0607
+9: Dropped
+10: -0.0007 0.0608
+11: Dropped
+12: -0.0006 0.0606
+13: 0.0002 0.0608
+14: Dropped
+15: -0.0007 0.0608
+16: Dropped
+17: Dropped
+18: -0.0008 0.0606
+19: Dropped
+20: Dropped
+21: Dropped
+22: -0.0004 0.0606
+23: Dropped
+24: Dropped
+25: -0.0005 0.0607
+Are the values in the theta column close to 0?
+Are the values in the delta column close to 0.06?
+Out of       26 packets sent, the server dropped       16 packets or roughly 61.5385%
+Did you detect roughly 12.5 dropped packets?
+If so, great! If not, keep working on it.
