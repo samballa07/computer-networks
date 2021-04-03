@@ -1,0 +1,379 @@
+#! /usr/bin/env python3
+import sys
+import socket
+import signal
+import threading
+import time
+import select
+import argparse
+from pprint import pprint
+
+parser = argparse.ArgumentParser(description='chat server')
+parser.add_argument('-p', '--port', help='port that server is listening on', required=True)
+args = vars(parser.parse_args())
+
+HOST = "127.0.0.1"
+PORT = int(args['port'])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+ADDR = (HOST, PORT)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+sock.setsockopt(socket.IPPROTO_TCP, 4, 1)
+sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+sock.bind(ADDR)
+
+clients = [{}] * 10
+rooms = {}
+
+
+def signal_handler(sig, frame):
+    pprint(clients)
+    pprint(rooms)
+    sock.close()
+    sys.exit(0)
+
+def connect_new_client(client_sock):
+    msg = client_sock.recv(7)
+    msg = bytearray(msg)
+    int_arr = [int(a) for a in msg]
+    int_arr[5] += 1
+    int_arr[6] -= 1
+    msg = client_sock.recv(5)
+    idx = -1
+    for i in range(len(clients)):
+        if clients[i] == {}:
+            idx = i
+            break
+    if idx == -1:
+        print("Server has max clients")
+        return -1
+    print("Got", client_sock.getsockname(),
+          "on port:", client_sock.getsockname()[1])
+
+    send_msg = "rand" + str(idx)
+    int_arr = bytearray(int_arr)
+    int_arr.extend(bytearray(send_msg.encode("utf-8")))
+    int_arr.insert(7, 0)
+
+    client_sock.send(bytearray(int_arr))
+    clients[idx] = {'name': send_msg, 'id' : idx, 'sock': client_sock, 'room': None}
+    return idx
+
+
+def send_list_users(client_sock, header, idx):
+    total_msg = bytearray()
+    total_msg.append(0)
+    if clients[idx]['room'] == None:
+        for client in clients:
+            if client != {}:
+                name_len = len(client['name'])
+                name_len = name_len.to_bytes(1, 'big')
+                total_msg.extend(name_len)
+                msg = client['name'].encode("utf-8")
+                total_msg.extend(msg)
+    else:
+        client_room = clients[idx]['room']
+        for client in rooms[client_room]['clients']:
+            total_msg.append(len(client["name"]))
+            total_msg.extend(client['name'].encode('utf-8'))
+    send_header = header[:2]
+    send_header.extend(len(total_msg).to_bytes(4, byteorder='big'))
+    send_header.append(254)
+    send_header.extend(total_msg)
+    client_sock.send(send_header)
+
+
+def handle_unknown(client_sock, header):
+    client_sock.recv(1)  # recv padding
+    error_len = client_sock.recv(2)
+    error_len = int.from_bytes(error_len, "big")
+    error = client_sock.recv(error_len)
+    print("Unkown command:", error.decode())
+    msg = 'You shout into the void and hear nothing but silence.'
+    msg_len = len(msg)+1
+    send_header = header[:2]
+    send_header.extend(msg_len.to_bytes(4, byteorder='big'))
+    send_header.append(254)
+    send_header.append(1)
+    msg = msg.encode('utf-8')
+    send_header.extend(msg)
+    client_sock.send(send_header)
+
+
+def change_name(client_sock, header, idx):
+    name_len = client_sock.recv(1)
+    name_len = int.from_bytes(name_len, "big")
+    name = client_sock.recv(name_len)
+    for client in clients:
+        if 'name' in client and client['name'] == name.decode('utf-8'):
+            temp_header = header[:2]
+            msg = 'Someone already nicked that nick.'
+            msg_len = len(msg) + 1
+            temp_header.extend(msg_len.to_bytes(4, byteorder='big'))
+            temp_header.append(254)
+            temp_header.append(1)
+            temp_header.extend(msg.encode('utf-8'))
+            client_sock.send(temp_header)
+            return
+    client = clients[idx]
+    client['name'] = name.decode('utf-8')
+    temp_header = header[:2]
+    temp_header.extend((1).to_bytes(4, byteorder='big'))
+    temp_header.append(254)
+    temp_header.append(0)
+    client_sock.send(temp_header)
+
+def close_client(client_sock, idx):
+    if clients[idx]['room'] != None:
+        room_name = clients[idx]['room']
+        for client in rooms[room_name]['clients']:
+            if client['id'] == idx:
+                rooms[room_name]['clients'].remove(client)
+                if rooms[room_name]['clients'] == []:
+                    del rooms[room_name]
+                break
+    clients[idx] = {}
+    client_sock.close()
+
+#checks whether the client is in already in a room and removes him from that room
+def join_room_helper(client_sock, idx):
+    if clients[idx]['room'] != None:
+        name = clients[idx]['room']
+        for client in rooms[name]['clients']:
+            if client['id'] == idx:
+                rooms[name]['clients'].remove(client)
+                if rooms[name]['clients'] ==[]:
+                    del rooms[name]
+                clients[idx]['room'] = None
+
+def client_in_room(client_sock, header, idx, name):
+    if clients[idx]['room'] == name:  # check that the client isnt already in the room
+        msg = 'You fail to bend space and time to reenter where you already are.'
+        msg_len = len(msg) + 1
+        send_header = header[:2]
+        send_header.extend(msg_len.to_bytes(4, byteorder='big'))
+        msg = msg.encode("utf-8")
+        send_header.append(254)
+        send_header.append(1)
+        send_header.extend(bytearray(msg))
+        client_sock.send(send_header)
+        return True
+    return False
+
+def join_room(client_sock, header, idx):
+    name_len = client_sock.recv(1)
+    name_len = int.from_bytes(name_len, "big")
+    name = client_sock.recv(name_len)
+    name = name.decode("utf-8")
+    pprint(rooms)
+    print("room name:", name)
+    if name in rooms:
+        pass_len = client_sock.recv(1)
+        pass_len = int.from_bytes(pass_len, "big")
+        passwd = ""
+        if pass_len != 0:
+            passwd = client_sock.recv(pass_len).decode('utf-8')
+        print("password:", passwd)
+
+        if rooms[name]['pass'] == None:
+            if client_in_room(client_sock, header, idx, name):
+                return
+            join_room_helper(client_sock, idx)
+            rooms[name]['clients'].append(clients[idx])
+            clients[idx]['room'] = name
+        else:
+            
+            if client_in_room(client_sock, header, idx, name):
+                return
+            join_room_helper(client_sock, idx)
+            if passwd != rooms[name]['pass']:
+                msg = 'Wrong password. You shall not pass!'
+                msg_len = len(msg) + 1
+                send_header = header[:2]
+                send_header.extend(msg_len.to_bytes(4, byteorder='big'))
+                send_header.append(254)
+                send_header.append(1)
+                send_header.extend(bytearray(msg.encode("utf-8")))
+                client_sock.send(send_header)
+                return
+            
+            rooms[name]['clients'].append(clients[idx])
+            clients[idx]['room'] = name
+    else:
+        join_room_helper(client_sock, idx)
+        rooms[name] = {'clients': [clients[idx]], 'pass': None}
+        pass_len = client_sock.recv(1)
+        pass_len = int.from_bytes(pass_len, "big")
+        if pass_len != 0:
+            passwd = client_sock.recv(pass_len).decode('utf-8')
+            rooms[name]['pass'] = passwd
+        clients[idx]['room'] = name
+
+    send_header = header[:2]
+    send_header.extend((1).to_bytes(4, byteorder='big'))
+    send_header.append(254)
+    send_header.append(0)
+    client_sock.send(send_header)
+    
+def list_rooms(client_sock, header):
+    data = bytearray()
+    data.append(0)
+    for room in rooms:
+        data.append(len(room))
+        name = room.encode('utf-8')
+        data.extend(name)
+    send_header = header[:2]
+    send_header.extend(len(data).to_bytes(4, byteorder='big'))
+    send_header.append(254)
+    send_header.extend(data)
+    client_sock.send(send_header)
+
+def disconnect_client(client_sock, header, idx):
+    header[-1] = 1
+    header.append(254)
+    header.append(0)
+    client_sock.send(header)
+    close_client(client_sock, idx)
+
+def leave(client_sock, header, idx):
+    if clients[idx]['room'] == None:
+        disconnect_client(client_sock, header, idx)
+        return True
+    else:
+        room_name = clients[idx]['room']
+        for client in rooms[room_name]['clients']:
+            if client['id'] == idx:
+                rooms[room_name]['clients'].remove(client)
+                if rooms[room_name]['clients'] == []:
+                    del rooms[room_name]
+                clients[idx]['room'] = None
+                break
+        header[-1] = 1
+        header.append(254)
+        header.append(0)
+        client_sock.send(header)
+        return False
+
+def send_messages(client_sock, header, idx):
+    room_name_len = client_sock.recv(1)
+    room_name_len = int.from_bytes(room_name_len, "big")
+    room_name = client_sock.recv(room_name_len).decode('utf-8')
+    msg_len = client_sock.recv(2)
+    temp_msg_len = int.from_bytes(msg_len, "big")
+    msg = client_sock.recv(temp_msg_len)
+
+    for client in rooms[room_name]['clients']:
+        if client['name'] == clients[idx]['name']:
+            client_header = header[:2]
+            client_header.extend((1).to_bytes(4, byteorder='big'))
+            client_header.append(254)
+            client_header.append(0)
+            client_sock.send(client_header)
+        else:
+            payload = bytearray()
+            payload.append(len(room_name))
+            payload.extend(room_name.encode('utf-8'))
+            payload.append(len(clients[idx]['name']))
+            payload.extend(clients[idx]['name'].encode('utf-8'))
+            payload.extend(msg_len)
+            payload.extend(msg)
+            client_header = header[:2]
+            len_payload = len(payload).to_bytes(4, byteorder='big')
+            client_header.extend(len_payload)
+            client_header.append(29)
+            client_header.extend(payload)
+            
+            this_client_sock = client['sock']
+            this_client_sock.send(client_header)
+
+def send_private(client_sock, header, idx):
+    user_name_len = client_sock.recv(1)
+    user_name_len = int.from_bytes(user_name_len, byteorder='big')
+    user_name = client_sock.recv(user_name_len).decode('utf-8')
+    msg_len = client_sock.recv(2)
+    temp_msg_len = int.from_bytes(msg_len, byteorder='big')
+    msg = client_sock.recv(temp_msg_len)
+    
+    send_sock = ''
+    for i in range(len(clients)):
+        if clients[i] == {}:
+            continue
+        if clients[i]['name'] == user_name:
+            send_sock = clients[i]['sock']
+            break
+    payload = bytearray()
+    payload.append(len(clients[idx]['name']))
+    payload.extend(clients[idx]['name'].encode('utf-8'))
+    payload.extend(msg_len)
+    payload.extend(msg)
+    client_header = header[:2]
+    len_payload = len(payload).to_bytes(4, byteorder='big')
+    client_header.extend(len_payload)
+    client_header.append(28)
+    client_header.extend(payload)
+    send_sock.send(client_header)
+    
+    this_header = header[:2]
+    this_header.extend((1).to_bytes(4, byteorder='big'))
+    this_header.append(254)
+    this_header.append(0)
+    client_sock.send(this_header)
+
+def check_in_room(idx):
+    if clients[idx]['room'] == None:
+        return False
+    return True
+
+def handle_client(client_sock, addr):
+    idx = connect_new_client(client_sock)
+    while True:
+        ready = select.select([client_sock], [], [], 120)
+        if not ready[0]:
+            close_client(client_sock, idx)
+            break
+        try:
+            header = client_sock.recv(6)
+            print("header:", header)
+            header = bytearray(header)
+            req = client_sock.recv(1)
+        except socket.error:
+            close_client(client_sock, idx)
+            break
+
+        if not header: # client disconnected
+            close_client(client_sock, idx)
+            break
+            
+        print("req:", req)
+        
+        if req == b'\x1a': #list users
+            send_list_users(client_sock, header, idx)
+        elif req == b'\x1b': #change name
+            change_name(client_sock, header, idx)
+        elif req == b'\x18': #leave room/server
+            if leave(client_sock, header, idx):
+                break
+        elif req == b'\x17': # join room
+            join_room(client_sock, header, idx)
+        elif req == b'\x19': #list rooms
+            list_rooms(client_sock, header)
+        elif req == b'\x1d':
+            if check_in_room(idx):
+                send_messages(client_sock, header, idx)
+            else:
+                handle_unknown(client_sock, header)
+        elif req == b'\x1c':
+            send_private(client_sock, header, idx)
+        else:
+            handle_unknown(client_sock, header)
+        
+       
+sock.listen(10)  # queue upto 10 connection requests
+while True:
+    signal.signal(signal.SIGINT, signal_handler)
+
+    client_sock, addr = sock.accept()
+    thread = threading.Thread(target=handle_client, args=(client_sock, addr))
+    thread.start()
