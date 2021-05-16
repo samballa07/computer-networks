@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+import sys
+import socket
+from pprint import pprint
+from new_tracker import Tracker, Peer 
+from messages import Message, QueuedMessage
+from torrent import Torrent
+from piece_manager import PieceManager
+import threading
+import time
+
+peer_connections = []
+# msg_queue contains QueuedMessages to be sent
+msg_queue = []
+lock = threading.Lock()
+
+
+def create_handshake(peer_id, info_hash):
+   pstrlen = (19).to_bytes(1, 'big')
+   pstr = 'BitTorrent protocol'.encode()
+   reserved = (0).to_bytes(8, 'big')
+   handshake = pstrlen + pstr + reserved + info_hash + peer_id 
+   return handshake
+
+def check_infohash_matches(peer_resp, info_hash):
+   peer_infohash = peer_resp[28:48]
+   return peer_infohash == info_hash
+
+# Continues receiving from sock until length has been received
+def recvfull(sock, length):
+    data = b''
+    while length > 0:
+        curr = sock.recv(length)
+        if not curr:
+            return -1
+        data += curr
+        length -= len(curr)
+    return data
+
+# Incoming messages logic
+# TODO: keep-alive. Timeout peer if we haven't communicated with them in a while.
+# DONE: choke
+# DONE: unchoke
+# DONE: interested
+# DONE: not interested
+# DONE: have
+# DONE: bitfield
+# TODO: request. Do this once we start seeding.
+# DONE: piece
+# TODO: cancel. Terminate connnection with peer.
+def listen_peer(peer):
+   while True:
+      try:
+         resp = recvfull(peer.sock, 4)
+         length = int.from_bytes(resp, 'big')
+         resp += recvfull(peer.sock, length)
+
+         # Create new message object and use it to parse response.
+         latest_message = Message()
+         latest_message.parse_message(resp)
+         
+         if latest_message.r_type != "keep-alive":
+            print("Receiving message of type " + latest_message.r_type + " from peer " + str(peer.idx), flush=True)
+         # Update peer's internal variables based on latest message.
+         lock.acquire()
+         peer.update_status(latest_message)
+
+         # Give new information to piece manager
+         if latest_message.r_type == "piece":
+            piece_manager.process_incoming_piece(latest_message.piece_index, latest_message.piece_offset, latest_message.block)
+            peer.pending_request = False
+
+         lock.release()
+               
+      except socket.error as err:
+         print("Socket error: " + str(err), flush=True)
+         break
+
+# Reads QueuedMessages from the message queue and decides whether to send them or cancel them
+# TODO: implement end condition for thread?
+def send_messages():
+   while True:
+      print("send_messages()")
+
+
+      # if len(msg_queue) > 0:
+      #    queued_message = msg_queue[0]
+      #    # Check if peer is choking client and msg is a request - in this case, do not send it, and tell piece_manager to cancel the request
+      #    if (queued_message.msg_type == 'request' and queued_message.peer.peer_choking):
+      #       with lock:
+      #          piece_manager.cancel_request(queued_message)
+      #    else:
+      #       # print("Attempting to send message")
+      #       queued_message.peer.sock.send(queued_message.message)
+      #       if queued_message.msg_type == 'request':
+      #          with lock:
+      #             piece_manager.outstanding_requests.remove(queued_message.peer)
+      #    del msg_queue[0]
+
+# Continually iterates through list of valid peers and queues a request to them if they are not choking us, have a block we need,
+# and we do not currently have an outstanding request to them.
+# TODO: implement end condition for thread?
+def queue_requests():
+   while True:
+      lock.acquire()
+      for peer in valid_peers:
+         # In progress: bitfield
+         send_bitfield = peer.send_bitfield_to_peer
+         # Done: interested
+         am_interested = piece_manager.check_if_interested(peer)
+         send_interested = peer.am_interested == False and am_interested == True
+         # Done: not interested
+         send_not_interested = peer.am_interested == True and am_interested == False
+         # In progress: request
+         send_request = peer.peer_choking == False and peer.am_interested == True and peer.pending_request == False
+         # TODO: keep-alive. Figure out when to send keep-alive messages.
+         # TODO: choke. Work on this for seeding.
+         # TODO: unchoke. Work on this for seeding.
+         # TODO: have. Work on this for seeding.
+         # TODO: piece. Work on this for seeding.
+         # TODO: cancel. Send cancel messages for End Game.
+         queued_message = None
+         if send_bitfield:
+            bitfield = piece_manager.generate_bitfield()
+            message = Message().m_bitfield(bitfield)
+            queued_message = QueuedMessage(message, "bitfield", peer)
+            peer.send_bitfield_to_peer = False
+            msg_queue.append(queued_message)
+         elif send_interested:
+            message = Message().m_interested()
+            queued_message = QueuedMessage(message, "interested", peer)
+            peer.am_interested = True
+            msg_queue.append(queued_message)
+         elif send_not_interested:
+            message = Message().m_uninterested()
+            queued_message = QueuedMessage(message, "not interested", peer)
+            peer.am_interested = False
+            msg_queue.append(queued_message)
+         elif send_request:
+            _, index, begin, length = piece_manager.next_request(peer)
+            message = Message().m_request(index, begin, length)
+            queued_message = QueuedMessage(message, "request", peer)
+            peer.pending_request = True
+            msg_queue.append(queued_message)
+         
+         if queued_message != None:
+            print("Sending message " + str(queued_message.msg_type) + " to peer " + str(peer.idx), flush=True)
+            if queued_message.msg_type == "request":
+               print("\tRequesting Piece: " + str(index) + "\t Block: " + str(begin) + "\t Length: " + str(length), flush=True)
+
+
+         # with lock:
+         #    should_send = (not peer.peer_choking and peer not in piece_manager.outstanding_requests)
+         #    # if peer.peer_choking:
+         #    #    print("Peer is choking, couldn't add request")
+         #    #    test_message = QueuedMessage(Message().m_keep_alive(), "keep alive", peer)
+         #    #    msg_queue.append(test_message)
+         # if should_send:
+         #    with lock:
+         #       (available, index, begin, length) = piece_manager.next_request(peer)
+         #    if available:
+         #       # print("Attempting to queue request")
+         #       queued_message = QueuedMessage(Message().m_request(index, begin, length), "request", peer)
+         #       msg_queue.append(queued_message)
+         #       piece_manager.outstanding_requests.append(peer)
+               #    print("Queued request: \t Index: " + str(index) + "\t Begin: " + str(begin) + "\t Length: " + str(length))
+      if piece_manager.complete:
+         break
+      while len(msg_queue) > 0:
+         queued_message = msg_queue[0]
+         queued_message.peer.sock.send(queued_message.message)
+         del msg_queue[0]
+      lock.release()
+
+
+compact = 'no' if len(sys.argv) < 3 else sys.argv[2]
+# Use "torrent" variable for .torrent file information
+torrent = Torrent(sys.argv[1])
+# Use piece_manager to handle data requests.
+piece_manager = PieceManager(torrent)
+# Use "tracker" variable for HTTP service information
+tracker = Tracker(compact, torrent)
+
+peers = tracker.get_peers()
+my_peerID = tracker.peerID
+info_hash = tracker.infohash
+
+handshake = create_handshake(my_peerID, info_hash)
+max_peers = 5
+# Use valid_peers for the information about each peer we are interacting with
+valid_peers = []
+for peer in peers:
+   HOST = peer.ip
+   PORT = peer.port
+   ADDR = (HOST, PORT)
+
+   sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+   sock.settimeout(1)
+   # sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+   try:
+      sock.connect(ADDR)
+      print(f'Connected to {HOST} on port {PORT}!')
+      sock.send(handshake)
+      resp = recvfull(sock, 68) #68 is the size of all handshake messages
+      # TODO: resp is sometimes -1. Handle this case.
+      print("Resp type: " + str(type(resp)) + "\t Resp: " + str(resp))
+      if resp != -1 and check_infohash_matches(resp, info_hash):
+         peer.sock = sock
+         peer.idx = len(valid_peers)
+         valid_peers.append(peer)
+         peer.sock.settimeout(120)
+   except socket.error as err:
+      print(f'Cant connect to {HOST} on port {PORT}')
+   
+   if len(valid_peers) >= max_peers:
+      break
+
+
+print("Number of valid peers: " + str(len(valid_peers)))
+
+for peer in valid_peers:
+   thread = threading.Thread(target=listen_peer, args=[peer])
+   thread.start()
+
+# thread = threading.Thread(target=send_messages, args=[])
+# thread.start()
+
+thread = threading.Thread(target=queue_requests, args=[])
+thread.start()

@@ -1,0 +1,474 @@
+#! /usr/bin/env python3
+import argparse, socket, sys, io
+from struct import Struct
+from pprint import pprint
+from random import randint
+parser = argparse.ArgumentParser(description='chat server')
+parser.add_argument('-a', '--addr', help='address', required=True)
+parser.add_argument('-d', '--dname', help='domain name', required=True)
+args = vars(parser.parse_args())
+
+addr = args['addr']
+domain_name = args['dname']
+port = 53
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(1)
+
+def construct_recursive_request(ns_domain, dns_type):
+    queries = bytearray()
+    if ns_domain != '.':
+        sub_domains = ns_domain.split('.')
+        if sub_domains[-1] == '':
+            sub_domains.pop()
+        
+        for sub in sub_domains:
+            temp = len(sub).to_bytes(1, 'big') + sub.encode('utf-8')
+            queries.extend(temp)
+    if dns_type == 'root':
+        queries.extend(b'\x00\x00\x02\x00\x01\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00')
+    elif dns_type == 'a':
+        # type A and class IN at the end of the queries
+        queries.extend(b'\x00\x00\x01\x00\x01')
+    elif dns_type == 'ns':
+        queries.extend(b'\x00\x00\x02\x00\x01')
+    t_id = randint(100, 65534).to_bytes(2, 'big')
+    header = bytearray(t_id + b'\x01\x20\x00\x01\x00\x00\x00\x00\x00\x00')
+    dns = header + queries
+    return dns
+
+def construct_dns_request(ns_domain, dns_type):
+    queries = bytearray()
+    if ns_domain != '.':
+        sub_domains = ns_domain.split('.')
+        if sub_domains[-1] == '':
+            sub_domains.pop()
+        
+        for sub in sub_domains:
+            temp = len(sub).to_bytes(1, 'big') + sub.encode('utf-8')
+            queries.extend(temp)
+    if dns_type == 'root':
+        queries.extend(b'\x00\x00\x02\x00\x01\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00')
+    elif dns_type == 'a':
+        # type A and class IN at the end of the queries
+        queries.extend(b'\x00\x00\x01\x00\x01')
+    elif dns_type == 'ns':
+        queries.extend(b'\x00\x00\x02\x00\x01')
+    t_id = randint(100, 65534).to_bytes(2, 'big')
+    header = bytearray(t_id + b'\x00\x20\x00\x01\x00\x00\x00\x00\x00\x00')
+    dns = header + queries
+    return dns
+
+
+packet = construct_dns_request('.', 'ns')
+server = (addr, 53)
+sock.sendto(packet, server)
+
+try:
+    response, resp_addr = sock.recvfrom(1024)
+except:
+    sys.exit(1)
+
+def get_type(r_type):
+    r_type = int.from_bytes(r_type, 'big')
+    if r_type == 2:
+        return 'NS'
+    elif r_type == 1:
+        return 'A'
+    elif r_type == 5:
+        return 'CNAME'
+    elif r_type == 28:
+        return 'AAAA'
+    return 'err'
+
+def get_ns_name(response, offset_ns):
+    stream = io.BytesIO(offset_ns)
+    length = stream.read(1)
+    while length == b'\xc0':
+        temp = length
+        temp += stream.read(1)
+        temp = int.from_bytes(temp, 'big')
+        offset = temp & 0x3FFF
+        stream = io.BytesIO(response[offset:])
+        length = stream.read(1)
+    
+    ns = []
+    while length != b'\x00' and length != b'\xc0' :
+        sub = stream.read(int.from_bytes(length, 'big'))
+        ns.append(sub.decode('utf-8'))
+        length = stream.read(1)
+    return ns, stream, length
+
+
+def deconstruct_dns_reply(response):
+
+    dns_header = Struct('!6H')
+    id, misc, qdcount, ancount, nscount, arcount = dns_header.unpack_from(
+        response)
+
+    qr = (misc & 0x8000) != 0
+    opcode = (misc & 0x7800) >> 11
+    aa = (misc & 0x0400) != 0
+    tc = (misc & 0x200) != 0
+    rd = (misc & 0x100) != 0
+    ra = (misc & 0x80) != 0
+    z = (misc & 0x70) >> 4
+    rcode = misc & 0xF
+    offset = dns_header.size
+    result = {
+        'id': id,
+        'is_response': qr,
+        'opcode': opcode,
+        'is_authoritative': aa,
+        'is_truncated': tc,
+        'recursion_desired': rd,
+        'recursion_available': ra,
+        'reserved': z,
+        'response_code': rcode,
+        'question_count': qdcount,
+        'answer_rr': ancount,
+        'authority_rr': nscount,
+        'additional_rr': arcount,
+    }
+    queries = response[12:]
+    stream = io.BytesIO(queries)
+    name = []
+    # deconstructing query part of response. not really needed
+    for _ in range(result['question_count']):
+        length = stream.read(1)
+        while length != b'\x00':
+            sub = stream.read(int.from_bytes(length, 'big'))
+            name.append(sub.decode('utf-8'))
+            length = stream.read(1)
+        dns_type = stream.read(2)
+        class_type = stream.read(2)
+    domain = '.'.join(name)
+
+    answer_rr = []
+    for i in range(result['answer_rr']):
+        length = stream.read(1)
+        temp_name = []
+        new_stream_used = False
+        name = str()
+        while length != b'\x00':
+            if int.from_bytes(length, 'big') >= 192:
+                temp = length
+                if not new_stream_used:
+                    off = stream.read(1)
+                    new_stream_used = True
+                else:
+                    off = new_stream.read(1)
+                temp += off
+                # print('TEMP',temp)
+                temp = int.from_bytes(temp, 'big')
+                offset = temp & 0x3FFF
+                offset_ns = response[offset:]
+                ns, new_stream, length = get_ns_name(response, offset_ns)
+                temp_name.extend(ns)
+            else:
+                sub = stream.read(int.from_bytes(length, 'big'))     
+                sub = sub.decode('utf-8')
+                temp_name.append(sub)
+                length = stream.read(1)
+        name = '.'.join(temp_name)
+        name += '.'
+        
+        record_type = stream.read(2)
+        class_type = stream.read(2)
+        ttl = stream.read(4)
+        data_length = stream.read(2)
+        record_type = get_type(record_type)
+        rr = {
+            'name': name,
+            'type': record_type,
+            'class': class_type,
+            'ttl': ttl,
+            'length': int.from_bytes(data_length, 'big'),
+        }
+        answer_rr.append(rr)
+        addr = []
+        length = stream.read(1)
+        count = 0
+        new_stream = stream
+        while length != b'\x00':
+           
+            if rr['type'] != "A" and int.from_bytes(length, 'big') >= 192 :
+                temp = length
+                
+                off = new_stream.read(1)
+
+           
+                temp += off
+                # print('TEMP',temp)
+                temp = int.from_bytes(temp, 'big')
+                offset = temp & 0x3FFF
+                offset_ns = response[offset:]
+                
+                ns, new_stream, length = get_ns_name(response, offset_ns)
+
+                addr.extend(ns)
+           
+            else:
+                if rr['type'] == 'NS' or rr['type'] == 'CNAME':
+                    sub = stream.read(int.from_bytes(length, 'big')) 
+                    sub = sub.decode('utf-8')
+                    addr.append(sub)
+                    length = stream.read(1)
+                elif rr['type'] == 'A':
+                    a = length
+                    for j in range(rr['length']):
+                        addr.append(str(int.from_bytes(a, 'big')))
+                        if j != rr['length'] -1:
+                            a = stream.read(1)
+                    break
+            count += 1
+        
+        answer_rr[i]['addr'] = '.'.join(addr)
+        answer_rr[i]['addr'] += '.'
+        
+
+    # deconstructing the authority rr's into an list of dicts
+    ns_domains = []
+    for i in range(result['authority_rr']):
+        length = stream.read(1)
+        if length == b'\xc0':
+            off = stream.read(1)
+        temp_name = []
+        new_stream = stream
+        count = 0
+        name = str()
+        while length != b'\x00':
+            ns = []
+            if int.from_bytes(length, 'big') >= 192:
+                temp = length
+                if count != 0:
+                    off = new_stream.read(1)
+                temp += off
+                # print('TEMP',temp)
+                temp = int.from_bytes(temp, 'big')
+                offset = temp & 0x3FFF
+                offset_ns = response[offset:]
+                ns, new_stream, length = get_ns_name(response, offset_ns)
+            else:
+                ns.append(stream.read(int.from_bytes(length, 'big')).decode('utf-8'))
+                length = stream.read(1)
+            
+            temp_name.extend(ns)
+            name = '.'.join(temp_name)
+            count += 1
+            
+        if name and name[-1] != '.':
+            name += '.'
+        
+        record_type = stream.read(2)
+        class_type = stream.read(2)
+        ttl = stream.read(4)
+        data_length = stream.read(2)
+        record_type = get_type(record_type)
+        rr = {
+            'name': name,
+            'type': record_type,
+            'class': class_type,
+            'ttl': ttl,
+            'length': int.from_bytes(data_length, 'big'),
+        }
+        ns_domains.append(rr)
+        ns = []
+        length = stream.read(1)
+        count = 0
+        new_stream_used = False
+        while length != b'\x00':
+            if int.from_bytes(length, 'big') >= 192:
+                off = bytes()
+                if not new_stream_used:
+                    off = stream.read(1)
+                    new_stream_used = True
+                else:
+                    off = new_stream.read(1)
+                length += off
+                length = int.from_bytes(length, 'big')
+                offset = length & 0x3FFF
+                offset_ns = response[offset:]
+                temp, new_stream, length = get_ns_name(response, offset_ns)
+                ns.extend(temp)
+            else:
+                sub = stream.read(int.from_bytes(length, 'big'))
+                sub = sub.decode('utf-8')
+                ns.append(sub)
+                length = stream.read(1)
+            count += 1
+        ns_domains[i]['ns'] = '.'.join(ns)
+        if ns_domains[i]['ns'][-1] != '.':
+            ns_domains[i]['ns'] += '.'
+
+    # deconstructing additional rr's if existing
+    additional_rr = []
+    for i in range(result['additional_rr']):
+        length = stream.read(1)
+        if int.from_bytes(length, 'big') >= 192:
+            off = stream.read(1)
+        temp_name = []
+        new_stream = stream
+        count = 0
+        name = str()
+        while length != b'\x00':
+            ns = []
+            if int.from_bytes(length, 'big') >= 192:
+                temp = length
+                if count != 0:
+                    off = new_stream.read(1)
+                temp += off
+                # print('TEMP',temp)
+                temp = int.from_bytes(temp, 'big')
+                offset = temp & 0x3FFF
+                offset_ns = response[offset:]
+                ns, new_stream, length = get_ns_name(response, offset_ns)
+            else:
+                sub = stream.read(int.from_bytes(length, 'big'))
+                ns.append(sub.decode('utf-8'))
+                length = stream.read(1)
+                
+            temp_name.extend(ns)
+            name = '.'.join(temp_name)
+            count += 1
+        name += '.'
+        
+
+        record_type = stream.read(2)
+        class_type = stream.read(2)
+        ttl = stream.read(4)
+        data_length = stream.read(2)
+        record_type = get_type(record_type)
+        rr = {
+            'name': name,
+            'type': record_type,
+            'class': class_type,
+            'ttl': ttl,
+            'length': int.from_bytes(data_length, 'big'),
+        }
+        additional_rr.append(rr)
+        addr = []
+        for _ in range(rr['length']):
+            sub = stream.read(1)
+            addr.append(str(int.from_bytes(sub, 'big')))
+        additional_rr[i]['addr'] = '.'.join(addr)
+
+    return ns_domains, additional_rr, answer_rr
+
+
+ns_domains, additional_rr, answer_rrs = deconstruct_dns_reply(response)
+# pprint(answer_rrs)
+# pprint(ns_domains)
+# pprint(additional_rr)
+for ans in answer_rrs:
+    print(f'{addr}: {ans["name"]} {ans["type"]} {ans["addr"]}')
+for domain in ns_domains:
+    print(f'{addr}: {domain["name"]} {domain["type"]} {domain["ns"]}')
+for addi in additional_rr:
+    if addi['type'] != 'AAAA':
+        print(f'{addr}: {addi["name"]} {addi["type"]} {addi["addr"]}')
+
+def recursive_query(authority_rr):
+    fqdn = authority_rr['ns']
+    packet = construct_recursive_request(fqdn, 'a')
+    server = ('8.8.8.8', 53)
+    sock.sendto(packet, server)
+    try:
+        response = sock.recvfrom(1024)[0]
+    except:
+        return []
+
+    authority, additionals, answers = deconstruct_dns_reply(response)
+    rr_with_a = []
+    for ans in answers:
+        if ans['type'] == 'A':
+            print(f'{"8.8.8.8"}: {ans["name"]} {ans["type"]} {ans["addr"]}')
+            rr_with_a.append(ans)
+    return rr_with_a
+
+
+def resolve(domain):
+    domains = additional_rr
+    target = domain_name
+    if additional_rr == []:
+        domains = answer_rrs
+        if answer_rrs == []:
+            domains = ns_domains
+    cname_exists = False
+    curr_ns = domains.pop(0)
+    old_domains = []
+    while domains != []:
+        #pprint(domains)
+        #temp_additional = additional.pop(0)
+        if curr_ns['type'] == 'AAAA':
+            try:
+                curr_ns = domains.pop(0)
+            except:
+                return 1
+        
+        if 'addr' in curr_ns:
+            last_ns_address = curr_ns['addr']
+        else:
+            last_ns_address = curr_ns['ns']
+        
+        packet = bytes()
+        packet = construct_dns_request(target, 'a')   
+        
+        if last_ns_address[-1] == '.':
+            last_ns_address = last_ns_address[:-1]
+        server = (last_ns_address, 53)
+        sock.sendto(packet, server)
+        try:
+            response, resp_addr = sock.recvfrom(1024)
+        except:
+            curr_ns = domains.pop(0)
+            continue
+
+        authority, additionals, answers = deconstruct_dns_reply(response)
+
+        a_exists = False
+        cname_exists = False
+        cname = str()
+        for ans in answers:
+            if ans['type'] == 'A':
+                a_exists = True
+            elif ans['type'] == 'CNAME':
+                cname_exists = True
+                cname = ans['addr']
+            print(f'{last_ns_address}: {ans["name"]} {ans["type"]} {ans["addr"]}')
+        for domain in authority:
+            print(f'{last_ns_address}: {domain["name"]} {domain["type"]} {domain["ns"]}')
+        for addi in additionals:
+            if addi['type'] != 'AAAA':
+                print(f'{last_ns_address}: {addi["name"]} {addi["type"]} {addi["addr"]}')
+
+        if a_exists:
+            return 0
+        elif cname_exists:
+            target = cname
+            domains.extend(old_domains)
+        elif authority != []:
+            old_domains.extend(domains)
+            domains = []
+            for j in range(len(authority)):
+                if j < len(additionals):
+                    domains.append(additionals[j])
+                else:
+                    a_rr = recursive_query(authority[j])
+                    domains.extend(a_rr)
+            try:
+                curr_ns = domains.pop(0)
+            except:
+                return 1
+        else:
+            try:
+                curr_ns = domains.pop(0)
+            except:
+                return 1
+                
+        # pprint(domains)
+        
+
+if resolve(domain_name):
+    sys.exit(1)
+sys.exit(0)
