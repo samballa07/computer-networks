@@ -1,3 +1,5 @@
+# Chat server
+
 In this project, we will be providing a chat client and will host a
 chat server. Clients allow users to communicate with one another by
 connecting to the server and interacting with it in accordance to an
