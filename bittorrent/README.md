@@ -2,7 +2,7 @@
 
 # Design
 
-![plot](./Screen Shot 2021-06-29 at 2.13.04 AM.png)
+![plot](./bittorrent_design.png)
 
 # How to run
 
