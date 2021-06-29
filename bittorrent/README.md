@@ -1,4 +1,13 @@
-# BitTorrent
+# BitTorrent Client
+
+# Design
+
+![plot](./Screen Shot 2021-06-29 at 2.13.04 AM.png)
+
+# How to run
+
+./client <torrent file> <compact>
+- Compact is a either a "yes" or "no". Many trackers require compact to be enabled to work
 
 ## Description
 
