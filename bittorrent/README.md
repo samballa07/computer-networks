@@ -6,7 +6,7 @@
 
 # How to run
 
-./client <torrent file> <compact>
+./client \<torrent file\> \<compact\>
 - Compact is a either a "yes" or "no". Many trackers require compact to be enabled to work
 
 ## Description
